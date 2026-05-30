@@ -241,6 +241,7 @@ func prCreateCmd() *cobra.Command {
 		flagHead      string
 		flagBase      string
 		flagDraft     bool
+		flagFill      bool
 		flagReviewers []string
 		flagAssignees []string
 		flagLabels    []string
@@ -252,11 +253,20 @@ func prCreateCmd() *cobra.Command {
 		Aliases: []string{"new"},
 		Short:   "Create a pull request",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if flagTitle == "" {
-				return fmt.Errorf("--title is required")
+			// If --fill, auto-detect head branch
+			if flagFill && flagHead == "" {
+				branch, err := getCurrentBranch()
+				if err != nil {
+					return fmt.Errorf("detecting current branch: %w", err)
+				}
+				flagHead = branch
+			}
+
+			if flagTitle == "" && !flagFill {
+				return fmt.Errorf("--title is required (or use --fill)")
 			}
 			if flagHead == "" {
-				return fmt.Errorf("--head is required")
+				return fmt.Errorf("--head is required (or use --fill)")
 			}
 
 			forge, owner, repoName, _, err := resolve.Repo(flagRepo, flagForgeType)
@@ -264,11 +274,36 @@ func prCreateCmd() *cobra.Command {
 				return err
 			}
 
+			// Determine base branch for --fill commit range
+			base := flagBase
+			if flagFill && base == "" {
+				repo, err := forge.Repos().Get(cmd.Context(), owner, repoName)
+				if err != nil {
+					return fmt.Errorf("fetching repository info: %w", err)
+				}
+				base = repo.DefaultBranch
+			}
+
+			// Fill title/body from commits if --fill
+			if flagFill {
+				fillTitle, fillBody, err := fillFromCommits(base)
+				if err != nil {
+					return err
+				}
+				// --title/--body flags override --fill values
+				if flagTitle == "" {
+					flagTitle = fillTitle
+				}
+				if flagBody == "" {
+					flagBody = fillBody
+				}
+			}
+
 			opts := forges.CreatePROpts{
 				Title:     flagTitle,
 				Body:      flagBody,
 				Head:      flagHead,
-				Base:      flagBase,
+				Base:      base,
 				Draft:     flagDraft,
 				Reviewers: flagReviewers,
 				Assignees: flagAssignees,
@@ -296,6 +331,7 @@ func prCreateCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&flagHead, "head", "H", "", "Head branch")
 	cmd.Flags().StringVarP(&flagBase, "base", "B", "", "Base branch")
 	cmd.Flags().BoolVarP(&flagDraft, "draft", "d", false, "Create as draft")
+	cmd.Flags().BoolVarP(&flagFill, "fill", "f", false, "Use commit info for title and body")
 	cmd.Flags().StringSliceVarP(&flagReviewers, "reviewer", "r", nil, "Request a reviewer")
 	cmd.Flags().StringSliceVarP(&flagAssignees, "assignee", "a", nil, "Assign to a user")
 	cmd.Flags().StringSliceVarP(&flagLabels, "label", "l", nil, "Add a label")
@@ -303,6 +339,77 @@ func prCreateCmd() *cobra.Command {
 	_ = cmd.Flags().MarkHidden("labels")
 	cmd.Flags().StringVarP(&flagMilestone, "milestone", "m", "", "Assign to a milestone")
 	return cmd
+}
+
+// getCurrentBranch returns the name of the current git branch.
+func getCurrentBranch() (string, error) {
+	out, err := exec.Command("git", "branch", "--show-current").Output()
+	if err != nil {
+		return "", fmt.Errorf("running git branch: %w", err)
+	}
+	branch := strings.TrimSpace(string(out))
+	if branch == "" {
+		return "", fmt.Errorf("not on a branch (detached HEAD?)")
+	}
+	return branch, nil
+}
+
+// fillFromCommits extracts PR title and body from commits between base and HEAD.
+// For a single commit, the title is the subject and body is the commit body.
+// For multiple commits, the title is the first commit's subject and body lists all commits.
+func fillFromCommits(base string) (title, body string, err error) {
+	// Get commits in reverse order (oldest first) with subject and body separated
+	// Format: subject<NUL>body<NUL><NUL> for each commit
+	out, err := exec.Command("git", "log", "--reverse", "--format=%s%x00%b%x00", base+"..HEAD").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("running git log: %w", err)
+	}
+
+	content := strings.TrimSuffix(string(out), "\x00")
+	if content == "" {
+		return "", "", fmt.Errorf("no commits between %s and HEAD", base)
+	}
+
+	// Split into commits (each ends with NUL)
+	parts := strings.Split(content, "\x00\x00")
+	var commits []struct{ subject, body string }
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		fields := strings.SplitN(part, "\x00", 2)
+		subject := fields[0]
+		var commitBody string
+		if len(fields) > 1 {
+			commitBody = strings.TrimSpace(fields[1])
+		}
+		commits = append(commits, struct{ subject, body string }{subject, commitBody})
+	}
+
+	if len(commits) == 0 {
+		return "", "", fmt.Errorf("no commits between %s and HEAD", base)
+	}
+
+	// Single commit: use subject as title, body as body
+	if len(commits) == 1 {
+		return commits[0].subject, commits[0].body, nil
+	}
+
+	// Multiple commits: title from first, body lists all
+	title = commits[0].subject
+	var bodyParts []string
+	for _, c := range commits {
+		entry := "* " + c.subject
+		if c.body != "" {
+			// Indent body lines
+			indented := strings.ReplaceAll(c.body, "\n", "\n  ")
+			entry += "\n\n  " + indented
+		}
+		bodyParts = append(bodyParts, entry)
+	}
+	body = strings.Join(bodyParts, "\n\n")
+	return title, body, nil
 }
 
 func prCloseCmd() *cobra.Command {
